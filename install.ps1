@@ -22,6 +22,9 @@ function Install-KeplerCrew {
         # 1. License key — env var, or prompt (never echoed, never left in shell history).
         $key = $env:KEPLER_LICENSE_KEY
         if ([string]::IsNullOrWhiteSpace($key)) {
+            if ([Console]::IsInputRedirected) {
+                throw 'Set KEPLER_LICENSE_KEY when running non-interactively.'
+            }
             $secure = Read-Host 'Enter your KeplerCrew license key' -AsSecureString
             $key = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
