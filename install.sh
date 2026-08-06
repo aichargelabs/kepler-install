@@ -26,7 +26,7 @@ valid=$(curl -fsSL -X POST "$API/licenses/actions/validate-key" \
     -H "$ACCEPT" -H "Content-Type: application/vnd.api+json" \
     -d "{\"meta\":{\"key\":\"$key\"}}" | tr -d ' \n' | sed -n 's/.*"valid":\(true\|false\).*/\1/p')
 if [ "$valid" != "true" ]; then
-    printf '%s\n' "Error: license is not valid. Contact support@keplercrew.com." >&2
+    printf '%s\n' "Error: license is not valid. Contact support@aichargelabs.com." >&2
     exit 1
 fi
 echo "License OK."

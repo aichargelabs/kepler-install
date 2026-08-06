@@ -50,7 +50,7 @@ are published.
 ## Getting a license
 
 KeplerCrew is licensed software. For a trial or purchase, contact
-support@keplercrew.com or visit [keplercrew.com](https://keplercrew.com).
+support@aichargelabs.com or visit [keplercrew.com](https://keplercrew.com).
 
 ## Uninstall
 

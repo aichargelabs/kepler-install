@@ -39,7 +39,7 @@ function Install-KeplerCrew {
             -Body (@{ meta = @{ key = $key } } | ConvertTo-Json)
         if (-not $validation.meta.valid) {
             $code = [string]$validation.meta.code
-            throw ('License is not valid (' + $code + '). Contact support@keplercrew.com.')
+            throw ('License is not valid (' + $code + '). Contact support@aichargelabs.com.')
         }
         Write-Host 'License OK.'
 
