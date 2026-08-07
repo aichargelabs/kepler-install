@@ -28,15 +28,33 @@ curl -fsSL https://get.keplercrew.com/install.sh | sh
 macOS and Linux bundles are coming soon. The script exits gracefully until they
 are published.
 
+## Updating
+
+Re-run the same install command to update in place:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://get.keplercrew.com/install.ps1 | iex"
+```
+
+or on macOS/Linux:
+
+```sh
+curl -fsSL https://get.keplercrew.com/install.sh | sh
+```
+
+The installer reuses the stored license key from the previous install. To force a
+reinstall even when already on the latest version, set `KEPLER_FORCE=1`.
+
 ## Options (environment variables)
 
 | Variable | Effect |
 | --- | --- |
-| `KEPLER_LICENSE_KEY` | License key (skips the prompt) |
+| `KEPLER_LICENSE_KEY` | License key (skips the prompt; stored key is reused on update) |
 | `KEPLER_VERSION` | Pin a version, e.g. `1.0.0` (default: latest) |
 | `KEPLER_DRY_RUN=1` | Resolve and print the release without downloading |
-| `KEPLER_INSTALL_DIR` | Install directory (default: `%LOCALAPPDATA%\Programs\KeplerCrew`) |
-| `KEPLER_NO_LAUNCH=1` | Install without launching |
+| `KEPLER_INSTALL_DIR` | Install directory (default: `%LOCALAPPDATA%\Programs\KeplerCrew` on Windows, `~/.local/share/keplercrew` on Unix) |
+| `KEPLER_NO_LAUNCH=1` | Install without launching (Windows) |
+| `KEPLER_FORCE=1` | Reinstall even when already on the resolved version |
 
 ## What the installer does
 
