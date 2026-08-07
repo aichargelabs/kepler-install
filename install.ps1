@@ -381,7 +381,28 @@ function Install-KeplerCrew {
 
         Write-Host ('KeplerCrew ' + $version + ' installed.')
 
-        # 9. Launch.
+        # 9. Register the 'kepler' command -- newer bundles ship kepler.cmd; older
+        #    archives without it skip this block so installs keep working unchanged.
+        $keplerCmd = Join-Path $installDir 'kepler.cmd'
+        if (Test-Path -LiteralPath $keplerCmd) {
+            try {
+                $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+                if ($null -eq $userPath) { $userPath = '' }
+                $onPath = $false
+                foreach ($entry in $userPath.Split(';')) {
+                    if ($entry.Trim().TrimEnd('\') -eq $installDir.TrimEnd('\')) { $onPath = $true; break }
+                }
+                if (-not $onPath) {
+                    [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $installDir), 'User')
+                }
+                Write-Host 'The kepler command is registered - in a NEW terminal try: kepler open | kepler status | kepler stop'
+            }
+            catch {
+                Write-Host ('Could not register the kepler command on PATH: ' + $_.Exception.Message)
+            }
+        }
+
+        # 10. Launch.
         $runScript = Join-Path $installDir 'run.ps1'
         if ((Test-Path -LiteralPath $runScript) -and ($env:KEPLER_NO_LAUNCH -ne '1')) {
             Write-Host 'Starting KeplerCrew...'
