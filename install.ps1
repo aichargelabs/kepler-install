@@ -93,10 +93,17 @@ function Install-KeplerCrew {
         $allReleases = (Invoke-RestMethod -Uri ($api + '/releases?limit=50') -Headers $auth).data |
             Where-Object { $_.attributes.status -eq 'PUBLISHED' -and $_.attributes.channel -eq 'stable' }
 
-        # Sort by semver: major, minor, patch (all numeric)
+        # Sort by semver: major, minor, patch (all numeric).
+        # attributes.semver is an OBJECT ({major,minor,patch,...}), so matching a regex
+        # against it always fails and every key collapses to 0 -- which silently left the
+        # picked release at the mercy of API order. Read the numeric fields, and fall back
+        # to parsing attributes.version (a string) when they are absent.
         $sortedReleases = $allReleases | Sort-Object {
-            $v = $_.attributes.semver
-            if ($v -match '^(\d+)\.(\d+)\.(\d+)$') {
+            $s = $_.attributes.semver
+            if ($null -ne $s -and $null -ne $s.major) {
+                [int]$s.major * 1000000 + [int]$s.minor * 1000 + [int]$s.patch
+            }
+            elseif ([string]$_.attributes.version -match '^(\d+)\.(\d+)\.(\d+)') {
                 [int]$Matches[1] * 1000000 + [int]$Matches[2] * 1000 + [int]$Matches[3]
             }
             else { 0 }
