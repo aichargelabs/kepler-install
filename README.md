@@ -25,9 +25,6 @@ powershell -ExecutionPolicy Bypass -Command "irm https://get.keplercrew.com/inst
 curl -fsSL https://get.keplercrew.com/install.sh | sh
 ```
 
-macOS and Linux bundles are coming soon. The script exits gracefully until they
-are published.
-
 ## Updating
 
 Re-run the same install command to update in place:
@@ -36,7 +33,7 @@ Re-run the same install command to update in place:
 powershell -ExecutionPolicy Bypass -Command "irm https://get.keplercrew.com/install.ps1 | iex"
 ```
 
-or on macOS/Linux:
+On macOS/Linux, re-run the installer to update in place:
 
 ```sh
 curl -fsSL https://get.keplercrew.com/install.sh | sh
@@ -53,7 +50,7 @@ reinstall even when already on the latest version, set `KEPLER_FORCE=1`.
 | `KEPLER_VERSION` | Pin a version, e.g. `1.0.0` (default: latest) |
 | `KEPLER_DRY_RUN=1` | Resolve and print the release without downloading |
 | `KEPLER_INSTALL_DIR` | Install directory (default: `%LOCALAPPDATA%\Programs\KeplerCrew` on Windows, `~/.local/share/keplercrew` on Unix) |
-| `KEPLER_NO_LAUNCH=1` | Install without launching (Windows) |
+| `KEPLER_NO_LAUNCH=1` | Install without launching |
 | `KEPLER_FORCE=1` | Reinstall even when already on the resolved version |
 
 ## What the installer does

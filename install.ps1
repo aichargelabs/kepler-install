@@ -10,18 +10,37 @@
 #   KEPLER_FORCE        set to 1 to reinstall even when already on the resolved version
 # Author: aichargelabs.
 
+# Runtime PS version check (no #Requires to avoid breaking irm|iex on some hosts)
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+    Write-Host 'PowerShell 5.0 or later is required. You are running version ' $PSVersionTable.PSVersion
+    Write-Host 'Please upgrade: https://docs.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows'
+    return
+}
+
 function Install-KeplerCrew {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
 
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # Proxy support: use system credentials for outbound connections
+        [Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+
+        # TLS hardening: add Tls12 (and Tls13 if available) instead of replacing all protocols
+        $currentProtocol = [Net.ServicePointManager]::SecurityProtocol
+        $currentProtocol = $currentProtocol -bor [Net.SecurityProtocolType]::Tls12
+        try {
+            $currentProtocol = $currentProtocol -bor [Net.SecurityProtocolType]::Tls13
+        }
+        catch {
+            # Tls13 not available on older .NET versions
+        }
+        [Net.ServicePointManager]::SecurityProtocol = $currentProtocol
 
         $account = '11cdb180-ce9f-4b8b-82c6-ca59f9b2c512'
         $api = 'https://api.keygen.sh/v1/accounts/' + $account
         $jsonApi = 'application/vnd.api+json'
 
-        # 0. Resolve the install directory first — an existing install supplies
+        # 0. Resolve the install directory first -- an existing install supplies
         #    the stored license key and the installed version for update checks.
         $installDir = $env:KEPLER_INSTALL_DIR
         if ([string]::IsNullOrWhiteSpace($installDir)) {
@@ -34,7 +53,7 @@ function Install-KeplerCrew {
             $installed = ([string](Get-Content -LiteralPath $versionFile -Raw)).Trim()
         }
 
-        # 1. License key — env var, stored key from a previous install, or prompt
+        # 1. License key -- env var, stored key from a previous install, or prompt
         #    (never echoed, never left in shell history).
         $key = $env:KEPLER_LICENSE_KEY
         if ([string]::IsNullOrWhiteSpace($key) -and (Test-Path -LiteralPath $licenseFile)) {
@@ -48,8 +67,9 @@ function Install-KeplerCrew {
                 throw 'Set KEPLER_LICENSE_KEY when running non-interactively.'
             }
             $secure = Read-Host 'Enter your KeplerCrew license key' -AsSecureString
-            $key = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+            $key = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
         $key = $key.Trim()
         if ([string]::IsNullOrWhiteSpace($key)) {
@@ -68,23 +88,47 @@ function Install-KeplerCrew {
         }
         Write-Host 'License OK.'
 
-        # 3. Resolve the release (latest published, or KEPLER_VERSION).
+        # 3. Resolve the release (latest published stable, or KEPLER_VERSION).
         $auth = @{ Accept = $jsonApi; Authorization = ('License ' + $key) }
-        $releases = (Invoke-RestMethod -Uri ($api + '/releases?limit=20') -Headers $auth).data |
-            Where-Object { $_.attributes.status -eq 'PUBLISHED' }
+        $allReleases = (Invoke-RestMethod -Uri ($api + '/releases?limit=50') -Headers $auth).data |
+            Where-Object { $_.attributes.status -eq 'PUBLISHED' -and $_.attributes.channel -eq 'stable' }
+
+        # Sort by semver: major, minor, patch (all numeric)
+        $sortedReleases = $allReleases | Sort-Object {
+            $v = $_.attributes.semver
+            if ($v -match '^(\d+)\.(\d+)\.(\d+)$') {
+                [int]$Matches[1] * 1000000 + [int]$Matches[2] * 1000 + [int]$Matches[3]
+            }
+            else { 0 }
+        } -Descending
+
         $wanted = $env:KEPLER_VERSION
         if (-not [string]::IsNullOrWhiteSpace($wanted)) {
             $wanted = $wanted.Trim().TrimStart('v')
-            $release = $releases | Where-Object { $_.attributes.version -eq $wanted } | Select-Object -First 1
+            $release = $sortedReleases | Where-Object { $_.attributes.version -eq $wanted } | Select-Object -First 1
             if ($null -eq $release) { throw ('Version "' + $wanted + '" was not found or your license cannot access it.') }
         }
         else {
-            $release = $releases | Select-Object -First 1
-            if ($null -eq $release) { throw 'No published release is available for your license.' }
+            $release = $sortedReleases | Select-Object -First 1
+            if ($null -eq $release) { throw 'No published stable release is available for your license.' }
         }
         $version = [string]$release.attributes.version
 
-        # 3b. Already on the resolved version? Nothing to do.
+        # 3b. Downgrade guard: refuse if resolved version is lower than installed (unless KEPLER_FORCE=1)
+        if (-not [string]::IsNullOrWhiteSpace($installed)) {
+            $installedParts = $installed.Split('.')
+            $versionParts = $version.Split('.')
+            $isDowngrade = $false
+            if ([int]$installedParts[0] -gt [int]$versionParts[0]) { $isDowngrade = $true }
+            elseif ([int]$installedParts[0] -eq [int]$versionParts[0] -and [int]$installedParts[1] -gt [int]$versionParts[1]) { $isDowngrade = $true }
+            elseif ([int]$installedParts[0] -eq [int]$versionParts[0] -and [int]$installedParts[1] -eq [int]$versionParts[1] -and [int]$installedParts[2] -gt [int]$versionParts[2]) { $isDowngrade = $true }
+
+            if ($isDowngrade -and $env:KEPLER_FORCE -ne '1') {
+                throw ('Downgrade refused: installed ' + $installed + ' is newer than ' + $version + '. Set KEPLER_FORCE=1 to allow downgrade.')
+            }
+        }
+
+        # 3c. Already on the resolved version? Nothing to do.
         if (($installed -eq $version) -and ($env:KEPLER_FORCE -ne '1')) {
             Write-Host ('KeplerCrew ' + $version + ' is already installed and up to date.')
             Write-Host 'Set KEPLER_FORCE=1 to reinstall.'
@@ -110,25 +154,63 @@ function Install-KeplerCrew {
         $metaReq.Accept = $jsonApi
         $metaReq.Headers.Add('Authorization', 'License ' + $key)
         $metaReq.AllowAutoRedirect = $false
+        # Apply proxy credentials to the request
+        $metaReq.Proxy = [Net.WebRequest]::GetSystemWebProxy()
+        $metaReq.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+
         $metaResp = $null
         try {
             $metaResp = $metaReq.GetResponse()
         }
         catch [Net.WebException] {
-            # .NET surfaces the 303 redirect itself as a WebException — recover it.
             $metaResp = $_.Exception.Response
-            if ($null -eq $metaResp -or [int]$metaResp.StatusCode -ge 400) {
-                throw ('Release ' + $version + ' has no Windows bundle yet (' + $filename + ' not found).')
+            if ($null -ne $metaResp) {
+                $statusCode = [int]$metaResp.StatusCode
+                $statusClass = [Math]::Floor($statusCode / 100)
+                if ($statusCode -eq 401 -or $statusCode -eq 403) {
+                    throw ('License entitlement denied (' + $statusCode + '). Check your license key and try again.')
+                }
+                elseif ($statusCode -eq 404) {
+                    throw ('Release ' + $version + ' has no Windows bundle yet (' + $filename + ' not found for this platform).')
+                }
+                elseif ($statusClass -eq 4 -or $statusClass -eq 5) {
+                    throw ('Service error (' + $statusCode + '). Please try again later.')
+                }
+            }
+            if ($null -eq $metaResp) {
+                throw ('Failed to connect to artifact service. Check your network.')
             }
         }
-        $location = [string]$metaResp.Headers['Location']
-        $reader = New-Object IO.StreamReader($metaResp.GetResponseStream())
-        $meta = $reader.ReadToEnd() | ConvertFrom-Json
-        $reader.Close(); $metaResp.Close()
-        if ([string]::IsNullOrWhiteSpace($location)) {
-            throw ('The artifact endpoint returned no download location for ' + $filename)
+
+        # Handle 303 redirect directly (PS 5.1 does NOT throw on 303)
+        $statusCode = [int]$metaResp.StatusCode
+        if ($statusCode -eq 302 -or $statusCode -eq 303 -or $statusCode -eq 307 -or $statusCode -eq 308) {
+            $location = [string]$metaResp.Headers['Location']
+            $reader = New-Object IO.StreamReader($metaResp.GetResponseStream())
+            $meta = $reader.ReadToEnd() | ConvertFrom-Json
+            $reader.Close(); $metaResp.Close()
+
+            if ([string]::IsNullOrWhiteSpace($location)) {
+                throw ('The artifact endpoint returned no download location for ' + $filename)
+            }
+            $expected = [string]$meta.data.attributes.checksum
+
+            # Checksum fail-closed: empty/missing checksum is fatal
+            if ([string]::IsNullOrWhiteSpace($expected)) {
+                throw ('Artifact metadata missing checksum - verification cannot proceed. Contact support.')
+            }
+
+            # Free-space check: need 2.5x artifact size free
+            $artifactSize = [long]$meta.data.attributes.size
+            $installDrive = (Split-Path $installDir -Qualifier)
+            $freeBytes = (Get-PSDrive -Name $installDrive.TrimEnd(':')).Free
+            if ($artifactSize * 2.5 -gt $freeBytes) {
+                throw ('Insufficient disk space. Need ' + [Math]::Ceiling($artifactSize * 2.5 / 1MB) + ' MB free on ' + $installDrive + ':, have ' + [Math]::Floor($freeBytes / 1MB) + ' MB.')
+            }
         }
-        $expected = [string]$meta.data.attributes.checksum
+        else {
+            throw ('Unexpected response from artifact endpoint: ' + $statusCode)
+        }
 
         if ($env:KEPLER_DRY_RUN -eq '1') {
             Write-Host ('Version:  ' + $version)
@@ -141,40 +223,146 @@ function Install-KeplerCrew {
         }
 
         # 5. Download from the signed URL (time-limited, no credentials attached).
-        Write-Host ('Downloading KeplerCrew ' + $version + '...')
-        $downloadDir = Join-Path $env:TEMP 'keplercrew-install'
-        New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-        $zipPath = Join-Path $downloadDir $filename
-        Invoke-WebRequest -Uri $location -OutFile $zipPath -UseBasicParsing
+        #    Retry once if download fails (signed URL may have expired mid-stream).
+        $downloadAttempt = 0
+        $downloadSucceeded = $false
+
+        while ($downloadAttempt -lt 2 -and -not $downloadSucceeded) {
+            $downloadAttempt++
+            if ($downloadAttempt -gt 1) {
+                Write-Host 'Download failed, retrying with fresh signed URL...'
+                # Re-request metadata to get a fresh signed URL
+                $metaReq = [Net.HttpWebRequest]::Create($api + '/releases/' + $release.id + '/artifacts/' + $filename)
+                $metaReq.Method = 'GET'
+                $metaReq.Accept = $jsonApi
+                $metaReq.Headers.Add('Authorization', 'License ' + $key)
+                $metaReq.AllowAutoRedirect = $false
+                $metaReq.Proxy = [Net.WebRequest]::GetSystemWebProxy()
+                $metaReq.Proxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+
+                $metaResp = $metaReq.GetResponse()
+                $statusCode = [int]$metaResp.StatusCode
+                if ($statusCode -eq 302 -or $statusCode -eq 303 -or $statusCode -eq 307 -or $statusCode -eq 308) {
+                    $location = [string]$metaResp.Headers['Location']
+                    $reader = New-Object IO.StreamReader($metaResp.GetResponseStream())
+                    $meta = $reader.ReadToEnd() | ConvertFrom-Json
+                    $reader.Close(); $metaResp.Close()
+                    $expected = [string]$meta.data.attributes.checksum
+                }
+                else {
+                    throw ('Failed to refresh signed URL: ' + $statusCode)
+                }
+            }
+
+            Write-Host ('Downloading KeplerCrew ' + $version + '...')
+            $downloadDir = Join-Path $env:TEMP ('keplercrew-install-' + $PID)
+            New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+            $zipPath = Join-Path $downloadDir $filename
+            try {
+                Invoke-WebRequest -Uri $location -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
+                $downloadSucceeded = $true
+            }
+            catch {
+                if ($downloadAttempt -ge 2) {
+                    throw ('Download failed after retry: ' + $_.Exception.Message)
+                }
+                # Will retry
+            }
+        }
 
         # 6. Verify checksum.
         if (-not [string]::IsNullOrWhiteSpace($expected)) {
             $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
             if ($actual -ne $expected.ToLowerInvariant()) {
-                throw ('Checksum mismatch — download corrupted. Expected ' + $expected + ' got ' + $actual)
+                throw ('Checksum mismatch -- download corrupted. Expected ' + $expected + ' got ' + $actual)
             }
             Write-Host 'Checksum OK.'
         }
 
         # 6b. Stop a running KeplerCrew from this install dir so files are not
-        #     locked during extraction (update-in-place).
+        #     locked during extraction. Match processes by Path OR MainModule path
+        #     (still never kill anything outside the install dir).
+        #     Note: powershell.exe hosting run.ps1 cannot be path-matched;
+        #     cwd locks are handled by the .old-swap approach.
         $prefix = $installDir.TrimEnd('\') + '\'
         $running = Get-Process -Name 'kepler-backend', 'kepler-engine', 'kepler' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }
+            Where-Object {
+                $pathMatch = $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+                $moduleMatch = $false
+                try { $moduleMatch = $_.MainModule.FileName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } catch { }
+                $pathMatch -or $moduleMatch
+            }
         if ($running) {
             Write-Host 'Stopping the running KeplerCrew...'
             $running | Stop-Process -Force
-            Start-Sleep -Seconds 2
+            $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
         }
 
-        # 7. Extract.
+        # 7. Extract to staging dir, validate, then atomic swap.
         Write-Host ('Installing to ' + $installDir + '...')
-        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force
+        $stagingDir = $installDir + '.new-' + $PID
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $stagingDir -Force
         Remove-Item -LiteralPath $zipPath -Force
+
+        # Validate run.ps1 exists in extraction
+        $extractedRunScript = Join-Path $stagingDir 'run.ps1'
+        if (-not (Test-Path -LiteralPath $extractedRunScript)) {
+            throw ('Extraction failed: run.ps1 not found in the archive.')
+        }
+
+        # Preserve licenses directory from current install (if exists)
+        $licenseDir = Join-Path $installDir 'licenses'
+        $stagingLicenseDir = Join-Path $stagingDir 'licenses'
+        if ((Test-Path -LiteralPath $licenseDir) -and -not (Test-Path -LiteralPath $stagingLicenseDir)) {
+            New-Item -ItemType Directory -Path $stagingLicenseDir -Force | Out-Null
+        }
+        if (Test-Path -LiteralPath $licenseFile) {
+            Copy-Item -LiteralPath $licenseFile -Destination $stagingLicenseDir -Force
+        }
+
+        # Perform the swap: rename current to .old, then .new into place.
+        # Use ABSOLUTE paths rooted at install dir's parent to avoid CWD dependence.
+        $installParent = Split-Path $installDir -Parent
+        $oldDir = $installDir + '.old'
+        $tempDir = Join-Path $installParent 'keplercrew-old-temp'
+        $swapSucceeded = $false
+        try {
+            if (Test-Path -LiteralPath $installDir) {
+                if (Test-Path -LiteralPath $oldDir) {
+                    Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Rename-Item -LiteralPath $installDir -NewName $tempDir -ErrorAction Stop
+                Rename-Item -LiteralPath $tempDir -NewName (Split-Path $oldDir -Leaf) -ErrorAction Stop
+            }
+            Rename-Item -LiteralPath $stagingDir -NewName (Split-Path $installDir -Leaf) -ErrorAction Stop
+            $swapSucceeded = $true
+        }
+        catch {
+            # Swap failed - leave .old in place for manual recovery
+            Write-Host ('Swap failed: ' + $_.Exception.Message)
+            Write-Host ('Staging directory left at: ' + $stagingDir)
+            throw ('Installation failed during swap. Please check the directories manually.')
+        }
+
+        # Clean up .old on success
+        if ($swapSucceeded -and (Test-Path -LiteralPath $oldDir)) {
+            Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        # Update installDir reference after swap
+        $installDir = $env:KEPLER_INSTALL_DIR
+        if ([string]::IsNullOrWhiteSpace($installDir)) {
+            $installDir = Join-Path $env:LOCALAPPDATA 'Programs\KeplerCrew'
+        }
+        $versionFile = Join-Path $installDir 'version.txt'
+        $licenseFile = Join-Path $installDir 'licenses\customer.key'
+
+        # Write version.txt LAST, only after swap succeeded
         Set-Content -LiteralPath $versionFile -Value $version -NoNewline -Encoding ascii
 
-        # 8. Store the license for the launcher — user-only ACL, never world-readable.
+        # 8. Store the license for the launcher -- user-only ACL, never world-readable.
         #    Delete any previous key file first: its ACL has inheritance stripped, so an
         #    update would otherwise fail with "Access to the path is denied".
         $licenseDir = Join-Path $installDir 'licenses'
@@ -185,7 +373,7 @@ function Install-KeplerCrew {
             Remove-Item -LiteralPath $licenseFile -Force
         }
         Set-Content -LiteralPath $licenseFile -Value $key -NoNewline -Encoding ascii
-        # Use the FULLY QUALIFIED identity (DOMAIN\User). A bare user name is ambiguous —
+        # Use the FULLY QUALIFIED identity (DOMAIN\User). A bare user name is ambiguous --
         # when the account name equals the machine name, icacls resolves it to the machine
         # account and writes an empty principal, locking the file out of future updates.
         icacls $licenseFile /inheritance:r `
@@ -197,15 +385,23 @@ function Install-KeplerCrew {
         $runScript = Join-Path $installDir 'run.ps1'
         if ((Test-Path -LiteralPath $runScript) -and ($env:KEPLER_NO_LAUNCH -ne '1')) {
             Write-Host 'Starting KeplerCrew...'
-            Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runScript -WorkingDirectory $installDir
+            Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $runScript + '"') -WorkingDirectory $installDir
         }
         else {
             Write-Host ('Run it any time: powershell -ExecutionPolicy Bypass -File "' + $runScript + '"')
         }
     }
     catch {
-        Write-Error ('KeplerCrew installation failed: ' + $_.Exception.Message)
-        exit 1
+        # Error path safe under iex: do NOT exit (closes customer's console)
+        # Print multi-line error in red with support contact
+        $host.UI.WriteErrorLine('')
+        $host.UI.WriteErrorLine('=== KeplerCrew Installation Failed ===')
+        $host.UI.WriteErrorLine('')
+        $host.UI.WriteErrorLine($_.Exception.Message)
+        $host.UI.WriteErrorLine('')
+        $host.UI.WriteErrorLine('Please try again or contact support@aichargelabs.com')
+        $host.UI.WriteErrorLine('')
+        return
     }
 }
 
