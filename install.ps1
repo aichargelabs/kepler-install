@@ -1,11 +1,13 @@
-# KeplerCrew client installer.
+# KeplerCrew client installer and updater.
 # Usage: powershell -ExecutionPolicy Bypass -Command "irm https://get.keplercrew.com/install.ps1 | iex"
+# Running it again updates an existing install to the latest published release.
 # Env:
-#   KEPLER_LICENSE_KEY  license key (prompted securely if not set)
+#   KEPLER_LICENSE_KEY  license key (existing install's stored key is reused; prompted otherwise)
 #   KEPLER_VERSION      optional version such as 1.0.0 (default: latest)
 #   KEPLER_DRY_RUN      set to 1 to resolve and print the release without downloading
 #   KEPLER_INSTALL_DIR  optional install directory (default: %LOCALAPPDATA%\Programs\KeplerCrew)
 #   KEPLER_NO_LAUNCH    set to 1 to skip launching after install
+#   KEPLER_FORCE        set to 1 to reinstall even when already on the resolved version
 # Author: aichargelabs.
 
 function Install-KeplerCrew {
@@ -19,8 +21,28 @@ function Install-KeplerCrew {
         $api = 'https://api.keygen.sh/v1/accounts/' + $account
         $jsonApi = 'application/vnd.api+json'
 
-        # 1. License key — env var, or prompt (never echoed, never left in shell history).
+        # 0. Resolve the install directory first — an existing install supplies
+        #    the stored license key and the installed version for update checks.
+        $installDir = $env:KEPLER_INSTALL_DIR
+        if ([string]::IsNullOrWhiteSpace($installDir)) {
+            $installDir = Join-Path $env:LOCALAPPDATA 'Programs\KeplerCrew'
+        }
+        $licenseFile = Join-Path $installDir 'licenses\customer.key'
+        $versionFile = Join-Path $installDir 'version.txt'
+        $installed = $null
+        if (Test-Path -LiteralPath $versionFile) {
+            $installed = ([string](Get-Content -LiteralPath $versionFile -Raw)).Trim()
+        }
+
+        # 1. License key — env var, stored key from a previous install, or prompt
+        #    (never echoed, never left in shell history).
         $key = $env:KEPLER_LICENSE_KEY
+        if ([string]::IsNullOrWhiteSpace($key) -and (Test-Path -LiteralPath $licenseFile)) {
+            $key = ([string](Get-Content -LiteralPath $licenseFile -Raw)).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($key)) {
+                Write-Host 'Using the stored license key.'
+            }
+        }
         if ([string]::IsNullOrWhiteSpace($key)) {
             if ([Console]::IsInputRedirected) {
                 throw 'Set KEPLER_LICENSE_KEY when running non-interactively.'
@@ -62,6 +84,21 @@ function Install-KeplerCrew {
         }
         $version = [string]$release.attributes.version
 
+        # 3b. Already on the resolved version? Nothing to do.
+        if (($installed -eq $version) -and ($env:KEPLER_FORCE -ne '1')) {
+            Write-Host ('KeplerCrew ' + $version + ' is already installed and up to date.')
+            Write-Host 'Set KEPLER_FORCE=1 to reinstall.'
+            return
+        }
+        if (-not [string]::IsNullOrWhiteSpace($installed)) {
+            if ($installed -eq $version) {
+                Write-Host ('Reinstalling KeplerCrew ' + $version + '...')
+            }
+            else {
+                Write-Host ('Updating KeplerCrew ' + $installed + ' -> ' + $version + '...')
+            }
+        }
+
         # 4. Resolve the Windows zip artifact of that release. License-key auth
         #    cannot LIST artifacts, so the filename follows the release convention.
         #    The singular endpoint answers 303 whose body carries the artifact
@@ -95,6 +132,9 @@ function Install-KeplerCrew {
 
         if ($env:KEPLER_DRY_RUN -eq '1') {
             Write-Host ('Version:  ' + $version)
+            if (-not [string]::IsNullOrWhiteSpace($installed)) {
+                Write-Host ('Installed: ' + $installed)
+            }
             Write-Host ('Artifact: ' + $filename)
             Write-Host ('SHA256:   ' + $expected)
             return
@@ -116,20 +156,27 @@ function Install-KeplerCrew {
             Write-Host 'Checksum OK.'
         }
 
-        # 7. Extract.
-        $installDir = $env:KEPLER_INSTALL_DIR
-        if ([string]::IsNullOrWhiteSpace($installDir)) {
-            $installDir = Join-Path $env:LOCALAPPDATA 'Programs\KeplerCrew'
+        # 6b. Stop a running KeplerCrew from this install dir so files are not
+        #     locked during extraction (update-in-place).
+        $prefix = $installDir.TrimEnd('\') + '\'
+        $running = Get-Process -Name 'kepler-backend', 'kepler-engine', 'kepler' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }
+        if ($running) {
+            Write-Host 'Stopping the running KeplerCrew...'
+            $running | Stop-Process -Force
+            Start-Sleep -Seconds 2
         }
+
+        # 7. Extract.
         Write-Host ('Installing to ' + $installDir + '...')
         New-Item -ItemType Directory -Path $installDir -Force | Out-Null
         Expand-Archive -LiteralPath $zipPath -DestinationPath $installDir -Force
         Remove-Item -LiteralPath $zipPath -Force
+        Set-Content -LiteralPath $versionFile -Value $version -NoNewline -Encoding ascii
 
         # 8. Store the license for the launcher — user-only ACL, never world-readable.
         $licenseDir = Join-Path $installDir 'licenses'
         New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
-        $licenseFile = Join-Path $licenseDir 'customer.key'
         Set-Content -LiteralPath $licenseFile -Value $key -NoNewline -Encoding ascii
         icacls $licenseFile /inheritance:r /grant:r ($env:USERNAME + ':(R,W)') | Out-Null
 
