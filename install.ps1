@@ -175,10 +175,21 @@ function Install-KeplerCrew {
         Set-Content -LiteralPath $versionFile -Value $version -NoNewline -Encoding ascii
 
         # 8. Store the license for the launcher — user-only ACL, never world-readable.
+        #    Delete any previous key file first: its ACL has inheritance stripped, so an
+        #    update would otherwise fail with "Access to the path is denied".
         $licenseDir = Join-Path $installDir 'licenses'
         New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+        if (Test-Path -LiteralPath $licenseFile) {
+            # takeown-free: we own the directory, so grant ourselves delete rights first.
+            icacls $licenseFile /grant ([Security.Principal.WindowsIdentity]::GetCurrent().Name + ':(F)') | Out-Null
+            Remove-Item -LiteralPath $licenseFile -Force
+        }
         Set-Content -LiteralPath $licenseFile -Value $key -NoNewline -Encoding ascii
-        icacls $licenseFile /inheritance:r /grant:r ($env:USERNAME + ':(R,W)') | Out-Null
+        # Use the FULLY QUALIFIED identity (DOMAIN\User). A bare user name is ambiguous —
+        # when the account name equals the machine name, icacls resolves it to the machine
+        # account and writes an empty principal, locking the file out of future updates.
+        icacls $licenseFile /inheritance:r `
+            /grant:r ([Security.Principal.WindowsIdentity]::GetCurrent().Name + ':(R,W)') | Out-Null
 
         Write-Host ('KeplerCrew ' + $version + ' installed.')
 
