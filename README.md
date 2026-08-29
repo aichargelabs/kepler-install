@@ -69,7 +69,33 @@ support@aichargelabs.com or visit [keplercrew.com](https://keplercrew.com).
 
 ## Uninstall
 
-Delete the install directory (default `%LOCALAPPDATA%\Programs\KeplerCrew`) and
-`%USERPROFILE%\.kepler-trial`.
+### Windows (PowerShell)
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://get.keplercrew.com/uninstall.ps1 | iex"
+```
+
+### macOS / Linux
+
+```sh
+curl -fsSL https://get.keplercrew.com/uninstall.sh | sh
+```
+
+The uninstaller stops the app, **frees your license seat** so the same key can be
+activated on another machine, removes the `kepler` command from your PATH, and
+deletes the install directory. Your projects and history in
+`%USERPROFILE%\.kepler-trial` (`~/.kepler-trial` on macOS/Linux) are **kept** — a
+later reinstall picks them up again.
+
+Do not simply delete the install folder: the license seat stays activated on a
+machine that no longer exists, and the next install with that key can be refused.
+If that has already happened, email support@aichargelabs.com to release it.
+
+| Variable | Effect |
+| --- | --- |
+| `KEPLER_PURGE=1` | Also delete your local data (projects, cycles, logs) |
+| `KEPLER_KEEP_LICENSE=1` | Keep the seat activated (reinstalling on this same machine) |
+| `KEPLER_YES=1` | Skip the confirmation prompt (unattended) |
+| `KEPLER_INSTALL_DIR` | Uninstall from a non-default install directory |
 
 KeplerCrew is developed by aichargelabs.
