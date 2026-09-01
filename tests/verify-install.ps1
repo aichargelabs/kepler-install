@@ -10,6 +10,25 @@ if ($errors.Count -ne 0) {
 }
 
 $text = [IO.File]::ReadAllText($InstallerPath)
+$priorTestOnly = $env:KEPLER_INSTALLER_TEST_ONLY
+$env:KEPLER_INSTALLER_TEST_ONLY = '1'
+try { . $InstallerPath }
+finally { $env:KEPLER_INSTALLER_TEST_ONLY = $priorTestOnly }
+
+$wideBindCases = @(
+    'python server.py --host 0.0.0.0',
+    'python server.py --host [::]',
+    'python server.py --host *',
+    '$host = "::"',
+    '[Net.IPAddress]::Any',
+    '[Net.IPAddress]::IPv6Any'
+)
+$wideBindBehavior = $true
+foreach ($case in $wideBindCases) {
+    if (-not (Test-KeplerWideBind -ScriptText $case)) { $wideBindBehavior = $false }
+}
+$loopbackBehavior = -not (Test-KeplerWideBind -ScriptText 'python server.py --host 127.0.0.1')
+
 $checks = [ordered]@{
     ParserClean = $true
     AuthenticodeGate = $text.Contains('Get-AuthenticodeSignature')
@@ -21,6 +40,10 @@ $checks = [ordered]@{
     NoQuarantineRestoreGuidance = ($text -notmatch '(?i)quarantined a binary: restore it')
     LoopbackOnlyProbe = $text.Contains('http://127.0.0.1:')
     RejectsWideBind = $text.Contains('BIND-WIDE')
+    RejectsWideBindVariants = ($wideBindBehavior -and $loopbackBehavior)
+    IncludesHiddenSignedFiles = ($text -match '(?is)Get-ChildItem[^\r\n]*-Force')
+    DefaultPathNeverElevates = ($text.Contains('DEFAULT-PATH-UNWRITABLE') -and $text.Contains('$customInstallDir'))
+    LaunchScopedIntegrityEvents = ($text.Contains('$StartedAt') -and $text.Contains('$launchStartedAt'))
     BoundedElevation = ($text.Contains('KEPLER_ELEVATED') -and $text.Contains('-Verb RunAs'))
     SacConditionalSignatureGate = ($text -match '(?is)if \(\$sacState -like ''On\*''\).*?Test-KeplerSignatureGate')
 }

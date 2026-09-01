@@ -35,12 +35,15 @@ function Get-KeplerSmartAppControlState {
 }
 
 function Get-KeplerCodeIntegrityBlocks {
+    param([datetime]$StartedAt)
     # Events 3033/3077 identify Code Integrity/SAC refusal, not a firewall error.
+    # Scope them to this launch so an older unrelated Kepler event cannot be
+    # misreported as the cause of today's startup failure.
     try {
         return @(Get-WinEvent -FilterHashtable @{
                 LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
                 Id = 3033, 3077
-                StartTime = (Get-Date).AddHours(-24)
+                StartTime = $StartedAt.AddSeconds(-2)
             } -ErrorAction Stop | Where-Object { $_.Message -match 'kepler' })
     }
     catch { return $null }
@@ -63,7 +66,7 @@ function Test-KeplerPathWritable {
 
 function Test-KeplerSignatureGate {
     param([string]$Root)
-    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -Include *.exe, *.dll -File -ErrorAction SilentlyContinue)
+    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -Include *.exe, *.dll -File -ErrorAction SilentlyContinue)
     if ($files.Count -eq 0) {
         throw 'No executable files were found in the downloaded bundle (error SIGN-NONE).'
     }
@@ -86,6 +89,21 @@ function Test-KeplerSignatureGate {
     Write-Host ('Signatures OK -- ' + $files.Count + ' executable file(s) verified.')
 }
 
+function Test-KeplerWideBind {
+    param([string]$ScriptText)
+    if ([string]::IsNullOrWhiteSpace($ScriptText)) { return $false }
+    $wideBind = @(
+        '(?i)(?:--host|--bind)\s+["'']?(?:0\.0\.0\.0|\[::\]|::|\*)',
+        '(?i)(?:host|bind)\s*=\s*["'']?(?:0\.0\.0\.0|\[::\]|::|\*)',
+        '(?i)IPAddress\]?\s*::\s*(?:Any|IPv6Any)',
+        '(?i)(?<![\d.])0\.0\.0\.0(?![\d.])'
+    )
+    foreach ($pattern in $wideBind) {
+        if ($ScriptText -match $pattern) { return $true }
+    }
+    return $false
+}
+
 function Wait-KeplerLoopbackHealth {
     param([int]$Attempts = 45, [int]$Seconds = 2)
     for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
@@ -102,8 +120,8 @@ function Wait-KeplerLoopbackHealth {
 }
 
 function Show-KeplerStartFailureGuidance {
-    param([string]$InstallDir, [string]$Version)
-    $blocks = Get-KeplerCodeIntegrityBlocks
+    param([string]$InstallDir, [string]$Version, [datetime]$StartedAt)
+    $blocks = Get-KeplerCodeIntegrityBlocks -StartedAt $StartedAt
     Write-Host ''
     if ($null -ne $blocks -and @($blocks).Count -gt 0) {
         Write-Host 'Windows Code Integrity (Smart App Control / WDAC) blocked startup; this is not a firewall failure.'
@@ -142,6 +160,7 @@ function Install-KeplerCrew {
 
         # 0. Resolve the install directory first -- an existing install supplies
         #    the stored license key and the installed version for update checks.
+        $customInstallDir = -not [string]::IsNullOrWhiteSpace($env:KEPLER_INSTALL_DIR)
         $installDir = $env:KEPLER_INSTALL_DIR
         if ([string]::IsNullOrWhiteSpace($installDir)) {
             $installDir = Join-Path $env:LOCALAPPDATA 'Programs\KeplerCrew'
@@ -156,6 +175,11 @@ function Install-KeplerCrew {
         # The default per-user directory needs no administrator rights. Elevate
         # once only when a custom protected directory is actually unwritable.
         if (-not (Test-KeplerPathWritable -Path $installDir)) {
+            if (-not $customInstallDir) {
+                throw ('The default per-user install directory is unexpectedly unwritable: "' +
+                    $installDir + '". Check your LOCALAPPDATA permissions; the installer will not request ' +
+                    'administrator rights for the default path (error DEFAULT-PATH-UNWRITABLE).')
+            }
             if ($env:KEPLER_ELEVATED -eq '1') {
                 throw ('The elevated installer still cannot write to "' + $installDir + '". Choose a user-writable KEPLER_INSTALL_DIR.')
             }
@@ -507,7 +531,7 @@ function Install-KeplerCrew {
 
         # KeplerCrew is local-only. A wide bind would create a real network
         # exposure and must not be "fixed" by adding a firewall exception.
-        if (([string](Get-Content -LiteralPath $extractedRunScript -Raw)) -match '0\.0\.0\.0') {
+        if (Test-KeplerWideBind -ScriptText ([string](Get-Content -LiteralPath $extractedRunScript -Raw))) {
             throw 'The bundle launcher requests a non-loopback bind. Installation stopped (error BIND-WIDE).'
         }
 
@@ -605,13 +629,14 @@ function Install-KeplerCrew {
         $runScript = Join-Path $installDir 'run.ps1'
         if ((Test-Path -LiteralPath $runScript) -and ($env:KEPLER_NO_LAUNCH -ne '1')) {
             Write-Host 'Starting KeplerCrew...'
+            $launchStartedAt = Get-Date
             Start-Process powershell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $runScript + '"') -WorkingDirectory $installDir
             $healthyOn = Wait-KeplerLoopbackHealth
             if ($healthyOn -gt 0) {
                 Write-Host ('Backend healthy on 127.0.0.1:' + $healthyOn + ' -- UI: http://127.0.0.1:' + $healthyOn + '/')
             }
             else {
-                Show-KeplerStartFailureGuidance -InstallDir $installDir -Version $version
+                Show-KeplerStartFailureGuidance -InstallDir $installDir -Version $version -StartedAt $launchStartedAt
             }
         }
         else {
@@ -632,4 +657,6 @@ function Install-KeplerCrew {
     }
 }
 
-Install-KeplerCrew
+if ($env:KEPLER_INSTALLER_TEST_ONLY -ne '1') {
+    Install-KeplerCrew
+}
