@@ -105,6 +105,15 @@ function Test-KeplerSignatureGate {
     Write-Host ('Signatures OK -- ' + $files.Count + ' executable file(s) verified.')
 }
 
+function Invoke-KeplerSacSignatureGate {
+    param([string]$SacState, [string]$Root)
+    if ($SacState -like 'On*') {
+        Test-KeplerSignatureGate -Root $Root
+        return $true
+    }
+    return $false
+}
+
 function Test-KeplerWideBind {
     param([string]$ScriptText)
     if ([string]::IsNullOrWhiteSpace($ScriptText)) { return $false }
@@ -126,8 +135,10 @@ function Wait-KeplerLoopbackHealth {
         Start-Sleep -Seconds $Seconds
         foreach ($port in 8890..8899) {
             try {
-                $null = Invoke-RestMethod -Uri ('http://127.0.0.1:' + $port + '/api/health') -TimeoutSec 2
-                return $port
+                $health = Invoke-RestMethod -Uri ('http://127.0.0.1:' + $port + '/api/health') -TimeoutSec 2
+                if ($null -ne $health -and ([string]$health.status -in @('ok', 'healthy'))) {
+                    return $port
+                }
             }
             catch { }
         }
@@ -548,9 +559,7 @@ function Install-KeplerCrew {
 
         # SAC-enabled Windows will refuse unsigned native code. Verify before
         # swapping the current install, and never suggest weakening that policy.
-        if ($sacState -like 'On*') {
-            Test-KeplerSignatureGate -Root $stagingDir
-        }
+        $null = Invoke-KeplerSacSignatureGate -SacState $sacState -Root $stagingDir
 
         # KeplerCrew is local-only. A wide bind would create a real network
         # exposure and must not be "fixed" by adding a firewall exception.

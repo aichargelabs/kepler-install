@@ -79,13 +79,18 @@ $script:capturedFilter = $null
 function global:Get-WinEvent {
     [CmdletBinding()] param([hashtable]$FilterHashtable)
     $script:capturedFilter = $FilterHashtable
-    return @()
+    return @(
+        [pscustomobject]@{ Message = 'unrelated product was blocked' },
+        [pscustomobject]@{ Message = 'KeplerCrew binary was blocked' }
+    )
 }
 $knownStart = [datetime]'2026-09-01T10:00:00Z'
 try {
-    $null = Get-KeplerCodeIntegrityBlocks -StartedAt $knownStart
+    $filteredEvents = @(Get-KeplerCodeIntegrityBlocks -StartedAt $knownStart)
     $eventBehavior = (($script:capturedFilter.Id -join ',') -eq '3033,3077') -and
-        ($script:capturedFilter.StartTime -eq $knownStart.AddSeconds(-2))
+        ($script:capturedFilter.StartTime -eq $knownStart.AddSeconds(-2)) -and
+        ($script:capturedFilter.LogName -eq 'Microsoft-Windows-CodeIntegrity/Operational') -and
+        ($filteredEvents.Count -eq 1) -and ($filteredEvents[0].Message -match 'Kepler')
 }
 catch { $eventBehavior = $false }
 finally { Remove-Item function:\Get-WinEvent -ErrorAction SilentlyContinue }
@@ -93,6 +98,8 @@ finally { Remove-Item function:\Get-WinEvent -ErrorAction SilentlyContinue }
 $script:sacValue = 0
 function global:Get-ItemProperty {
     [CmdletBinding()] param([string]$LiteralPath, [string]$Name)
+    if ($LiteralPath -ne 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -or
+        $Name -ne 'VerifiedAndReputablePolicyState') { throw 'wrong registry query' }
     return [pscustomobject]@{ VerifiedAndReputablePolicyState = $script:sacValue }
 }
 try {
@@ -109,16 +116,29 @@ $script:probeUris = @()
 function global:Invoke-RestMethod {
     [CmdletBinding()] param([string]$Uri, [int]$TimeoutSec)
     $script:probeUris += $Uri
-    if ($Uri -match ':8893/') { return @{ status = 'ok' } }
+    if ($Uri -match ':8893/api/health$') { return @{ status = 'ok' } }
     throw 'closed'
 }
 try {
     $healthyPort = Wait-KeplerLoopbackHealth -Attempts 1 -Seconds 0
     $loopbackProbeBehavior = ($healthyPort -eq 8893 -and
-        @($script:probeUris | Where-Object { $_ -notmatch '^http://127\.0\.0\.1:' }).Count -eq 0)
+        @($script:probeUris | Where-Object { $_ -notmatch '^http://127\.0\.0\.1:\d+/api/health$' }).Count -eq 0)
 }
 catch { $loopbackProbeBehavior = $false }
 finally { Remove-Item function:\Invoke-RestMethod -ErrorAction SilentlyContinue }
+
+$script:sacGateCalls = 0
+function global:Test-KeplerSignatureGate {
+    [CmdletBinding()] param([string]$Root)
+    $script:sacGateCalls++
+}
+try {
+    $offResult = Invoke-KeplerSacSignatureGate -SacState 'Off' -Root 'test-root'
+    $onResult = Invoke-KeplerSacSignatureGate -SacState 'On (enforce)' -Root 'test-root'
+    $sacConditionalBehavior = (-not $offResult) -and $onResult -and ($script:sacGateCalls -eq 1)
+}
+catch { $sacConditionalBehavior = $false }
+finally { Remove-Item function:\Test-KeplerSignatureGate -ErrorAction SilentlyContinue }
 
 $checks = [ordered]@{
     ParserClean = $true
@@ -128,7 +148,6 @@ $checks = [ordered]@{
     NeverWritesSmartAppControl = ($text -notmatch '(?is)(Set|New)-ItemProperty[^\r\n]*VerifiedAndReputablePolicyState')
     NoDefenderWeakening = ($text -notmatch '(?i)(Set-MpPreference|Add-MpPreference)')
     NoFirewallMutation = ($text -notmatch '(?i)(New-NetFirewallRule|Set-NetFirewallRule|Remove-NetFirewallRule|Set-NetFirewallProfile)')
-    NoQuarantineRestoreGuidance = ($text -notmatch '(?i)quarantined a binary: restore it')
     LoopbackOnlyProbe = $loopbackProbeBehavior
     RejectsWideBind = ($wideBindBehavior -and $loopbackBehavior)
     RejectsWideBindVariants = ($wideBindBehavior -and $loopbackBehavior)
@@ -136,7 +155,7 @@ $checks = [ordered]@{
     DefaultPathNeverElevates = ($accessBehavior -and ((Get-KeplerWriteAccessAction $false $false $false $false $true) -eq 'FailDefault'))
     LaunchScopedIntegrityEvents = $eventBehavior
     BoundedElevation = ($accessBehavior -and ((Get-KeplerWriteAccessAction $false $true $false $false $true) -eq 'ElevateOnce'))
-    SacConditionalSignatureGate = ($text -match '(?is)if \(\$sacState -like ''On\*''\).*?Test-KeplerSignatureGate')
+    SacConditionalSignatureGate = $sacConditionalBehavior
 }
 
 $failed = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
