@@ -64,6 +64,22 @@ function Test-KeplerPathWritable {
     catch { return $false }
 }
 
+function Get-KeplerWriteAccessAction {
+    param(
+        [bool]$Writable,
+        [bool]$CustomInstallDir,
+        [bool]$AlreadyElevated,
+        [bool]$Administrator,
+        [bool]$HasScriptPath
+    )
+    if ($Writable) { return 'Continue' }
+    if (-not $CustomInstallDir) { return 'FailDefault' }
+    if ($AlreadyElevated) { return 'FailElevated' }
+    if ($Administrator) { return 'FailAdministrator' }
+    if (-not $HasScriptPath) { return 'FailScriptless' }
+    return 'ElevateOnce'
+}
+
 function Test-KeplerSignatureGate {
     param([string]$Root)
     $files = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -Include *.exe, *.dll -File -ErrorAction SilentlyContinue)
@@ -174,20 +190,27 @@ function Install-KeplerCrew {
 
         # The default per-user directory needs no administrator rights. Elevate
         # once only when a custom protected directory is actually unwritable.
-        if (-not (Test-KeplerPathWritable -Path $installDir)) {
-            if (-not $customInstallDir) {
+        $writable = Test-KeplerPathWritable -Path $installDir
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        $writeAction = Get-KeplerWriteAccessAction `
+            -Writable $writable `
+            -CustomInstallDir $customInstallDir `
+            -AlreadyElevated ($env:KEPLER_ELEVATED -eq '1') `
+            -Administrator $isAdmin `
+            -HasScriptPath (-not [string]::IsNullOrWhiteSpace($PSCommandPath))
+        if ($writeAction -ne 'Continue') {
+            if ($writeAction -eq 'FailDefault') {
                 throw ('The default per-user install directory is unexpectedly unwritable: "' +
                     $installDir + '". Check your LOCALAPPDATA permissions; the installer will not request ' +
                     'administrator rights for the default path (error DEFAULT-PATH-UNWRITABLE).')
             }
-            if ($env:KEPLER_ELEVATED -eq '1') {
+            if ($writeAction -eq 'FailElevated') {
                 throw ('The elevated installer still cannot write to "' + $installDir + '". Choose a user-writable KEPLER_INSTALL_DIR.')
             }
-            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            if ($isAdmin) {
+            if ($writeAction -eq 'FailAdministrator') {
                 throw ('"' + $installDir + '" is not writable even with administrator rights. Choose another KEPLER_INSTALL_DIR.')
             }
-            if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+            if ($writeAction -eq 'FailScriptless') {
                 throw ('"' + $installDir + '" needs administrator rights. Save install.ps1 and run it from an elevated PowerShell, or use the default per-user directory.')
             }
             Write-Host ('"' + $installDir + '" needs administrator rights -- requesting UAC consent once...')

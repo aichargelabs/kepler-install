@@ -29,22 +29,113 @@ foreach ($case in $wideBindCases) {
 }
 $loopbackBehavior = -not (Test-KeplerWideBind -ScriptText 'python server.py --host 127.0.0.1')
 
+$accessCases = @(
+    @($true,  $false, $false, $false, $false, 'Continue'),
+    @($false, $false, $false, $false, $false, 'FailDefault'),
+    @($false, $true,  $true,  $false, $true,  'FailElevated'),
+    @($false, $true,  $false, $true,  $true,  'FailAdministrator'),
+    @($false, $true,  $false, $false, $false, 'FailScriptless'),
+    @($false, $true,  $false, $false, $true,  'ElevateOnce')
+)
+$accessBehavior = $true
+foreach ($case in $accessCases) {
+    $actual = Get-KeplerWriteAccessAction -Writable $case[0] -CustomInstallDir $case[1] `
+        -AlreadyElevated $case[2] -Administrator $case[3] -HasScriptPath $case[4]
+    if ($actual -ne $case[5]) { $accessBehavior = $false }
+}
+
+$testRoot = Join-Path $env:TEMP ('kepler-installer-test-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+$hiddenExe = Join-Path $testRoot 'hidden.exe'
+Set-Content -LiteralPath $hiddenExe -Value 'MZ' -Encoding ascii
+(Get-Item -LiteralPath $hiddenExe).Attributes = `
+    ((Get-Item -LiteralPath $hiddenExe).Attributes -bor [IO.FileAttributes]::Hidden)
+$script:signatureCalls = 0
+function global:Get-AuthenticodeSignature {
+    [CmdletBinding()] param([string]$LiteralPath)
+    $script:signatureCalls++
+    return [pscustomobject]@{ Status = 'Valid' }
+}
+try {
+    Test-KeplerSignatureGate -Root $testRoot
+    $hiddenSignatureBehavior = ($script:signatureCalls -eq 1)
+    function global:Get-AuthenticodeSignature {
+        [CmdletBinding()] param([string]$LiteralPath)
+        return [pscustomobject]@{ Status = 'NotSigned' }
+    }
+    try {
+        Test-KeplerSignatureGate -Root $testRoot
+        $invalidSignatureBehavior = $false
+    }
+    catch { $invalidSignatureBehavior = ($_.Exception.Message -match 'SIGN-INVALID') }
+}
+catch { $hiddenSignatureBehavior = $false; $invalidSignatureBehavior = $false }
+finally {
+    Remove-Item function:\Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$script:capturedFilter = $null
+function global:Get-WinEvent {
+    [CmdletBinding()] param([hashtable]$FilterHashtable)
+    $script:capturedFilter = $FilterHashtable
+    return @()
+}
+$knownStart = [datetime]'2026-09-01T10:00:00Z'
+try {
+    $null = Get-KeplerCodeIntegrityBlocks -StartedAt $knownStart
+    $eventBehavior = (($script:capturedFilter.Id -join ',') -eq '3033,3077') -and
+        ($script:capturedFilter.StartTime -eq $knownStart.AddSeconds(-2))
+}
+catch { $eventBehavior = $false }
+finally { Remove-Item function:\Get-WinEvent -ErrorAction SilentlyContinue }
+
+$script:sacValue = 0
+function global:Get-ItemProperty {
+    [CmdletBinding()] param([string]$LiteralPath, [string]$Name)
+    return [pscustomobject]@{ VerifiedAndReputablePolicyState = $script:sacValue }
+}
+try {
+    $script:sacValue = 0; $sacOff = Get-KeplerSmartAppControlState
+    $script:sacValue = 1; $sacOn = Get-KeplerSmartAppControlState
+    $script:sacValue = 2; $sacEvaluation = Get-KeplerSmartAppControlState
+    $sacReadBehavior = ($sacOff -eq 'Off' -and $sacOn -eq 'On (enforce)' -and
+        $sacEvaluation -eq 'On (evaluation)')
+}
+catch { $sacReadBehavior = $false }
+finally { Remove-Item function:\Get-ItemProperty -ErrorAction SilentlyContinue }
+
+$script:probeUris = @()
+function global:Invoke-RestMethod {
+    [CmdletBinding()] param([string]$Uri, [int]$TimeoutSec)
+    $script:probeUris += $Uri
+    if ($Uri -match ':8893/') { return @{ status = 'ok' } }
+    throw 'closed'
+}
+try {
+    $healthyPort = Wait-KeplerLoopbackHealth -Attempts 1 -Seconds 0
+    $loopbackProbeBehavior = ($healthyPort -eq 8893 -and
+        @($script:probeUris | Where-Object { $_ -notmatch '^http://127\.0\.0\.1:' }).Count -eq 0)
+}
+catch { $loopbackProbeBehavior = $false }
+finally { Remove-Item function:\Invoke-RestMethod -ErrorAction SilentlyContinue }
+
 $checks = [ordered]@{
     ParserClean = $true
-    AuthenticodeGate = $text.Contains('Get-AuthenticodeSignature')
-    RejectsInvalidSignature = $text.Contains('SIGN-INVALID')
-    ReadsSmartAppControl = $text.Contains('VerifiedAndReputablePolicyState')
+    AuthenticodeGate = $hiddenSignatureBehavior
+    RejectsInvalidSignature = $invalidSignatureBehavior
+    ReadsSmartAppControl = $sacReadBehavior
     NeverWritesSmartAppControl = ($text -notmatch '(?is)(Set|New)-ItemProperty[^\r\n]*VerifiedAndReputablePolicyState')
     NoDefenderWeakening = ($text -notmatch '(?i)(Set-MpPreference|Add-MpPreference)')
     NoFirewallMutation = ($text -notmatch '(?i)(New-NetFirewallRule|Set-NetFirewallRule|Remove-NetFirewallRule|Set-NetFirewallProfile)')
     NoQuarantineRestoreGuidance = ($text -notmatch '(?i)quarantined a binary: restore it')
-    LoopbackOnlyProbe = $text.Contains('http://127.0.0.1:')
-    RejectsWideBind = $text.Contains('BIND-WIDE')
+    LoopbackOnlyProbe = $loopbackProbeBehavior
+    RejectsWideBind = ($wideBindBehavior -and $loopbackBehavior)
     RejectsWideBindVariants = ($wideBindBehavior -and $loopbackBehavior)
-    IncludesHiddenSignedFiles = ($text -match '(?is)Get-ChildItem[^\r\n]*-Force')
-    DefaultPathNeverElevates = ($text.Contains('DEFAULT-PATH-UNWRITABLE') -and $text.Contains('$customInstallDir'))
-    LaunchScopedIntegrityEvents = ($text.Contains('$StartedAt') -and $text.Contains('$launchStartedAt'))
-    BoundedElevation = ($text.Contains('KEPLER_ELEVATED') -and $text.Contains('-Verb RunAs'))
+    IncludesHiddenSignedFiles = $hiddenSignatureBehavior
+    DefaultPathNeverElevates = ($accessBehavior -and ((Get-KeplerWriteAccessAction $false $false $false $false $true) -eq 'FailDefault'))
+    LaunchScopedIntegrityEvents = $eventBehavior
+    BoundedElevation = ($accessBehavior -and ((Get-KeplerWriteAccessAction $false $true $false $false $true) -eq 'ElevateOnce'))
     SacConditionalSignatureGate = ($text -match '(?is)if \(\$sacState -like ''On\*''\).*?Test-KeplerSignatureGate')
 }
 
