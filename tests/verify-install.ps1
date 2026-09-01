@@ -2,7 +2,7 @@ param([Parameter(Mandatory = $true)][string]$InstallerPath)
 
 $tokens = $null
 $errors = $null
-$null = [System.Management.Automation.Language.Parser]::ParseFile(
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
     $InstallerPath, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) {
     $errors | ForEach-Object { Write-Error $_.Message }
@@ -123,6 +123,19 @@ try {
     $healthyPort = Wait-KeplerLoopbackHealth -Attempts 1 -Seconds 0
     $loopbackProbeBehavior = ($healthyPort -eq 8893 -and
         @($script:probeUris | Where-Object { $_ -notmatch '^http://127\.0\.0\.1:\d+/api/health$' }).Count -eq 0)
+    function global:Invoke-RestMethod {
+        [CmdletBinding()] param([string]$Uri, [int]$TimeoutSec)
+        if ($Uri -match ':8892/api/health$') { return @{ status = 'healthy' } }
+        throw 'closed'
+    }
+    $loopbackProbeBehavior = $loopbackProbeBehavior -and
+        ((Wait-KeplerLoopbackHealth -Attempts 1 -Seconds 0) -eq 8892)
+    function global:Invoke-RestMethod {
+        [CmdletBinding()] param([string]$Uri, [int]$TimeoutSec)
+        return @{ status = 'starting' }
+    }
+    $loopbackProbeBehavior = $loopbackProbeBehavior -and
+        ((Wait-KeplerLoopbackHealth -Attempts 1 -Seconds 0) -eq 0)
 }
 catch { $loopbackProbeBehavior = $false }
 finally { Remove-Item function:\Invoke-RestMethod -ErrorAction SilentlyContinue }
@@ -141,6 +154,20 @@ try {
 catch { $sacConditionalBehavior = $false }
 finally { Set-Item function:\Test-KeplerSignatureGate $originalSignatureGate }
 
+# Verify production wiring through the parsed command AST, not a text marker.
+# Commenting/removing the call makes this zero even if helper tests still pass.
+$installFunction = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Install-KeplerCrew'
+}, $true)
+$wiredSacCommands = @($installFunction.Body.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Invoke-KeplerSacSignatureGate'
+}, $true))
+$productionSacWiringBehavior = ($wiredSacCommands.Count -eq 1)
+
 $checks = [ordered]@{
     ParserClean = $true
     AuthenticodeGate = $hiddenSignatureBehavior
@@ -156,7 +183,7 @@ $checks = [ordered]@{
     DefaultPathNeverElevates = ($accessBehavior -and ((Get-KeplerWriteAccessAction $false $false $false $false $true) -eq 'FailDefault'))
     LaunchScopedIntegrityEvents = $eventBehavior
     BoundedElevation = ($accessBehavior -and ((Get-KeplerWriteAccessAction $false $true $false $false $true) -eq 'ElevateOnce'))
-    SacConditionalSignatureGate = $sacConditionalBehavior
+    SacConditionalSignatureGate = ($sacConditionalBehavior -and $productionSacWiringBehavior)
 }
 
 $failed = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
