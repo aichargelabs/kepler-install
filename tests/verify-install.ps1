@@ -128,7 +128,8 @@ catch { $loopbackProbeBehavior = $false }
 finally { Remove-Item function:\Invoke-RestMethod -ErrorAction SilentlyContinue }
 
 $script:sacGateCalls = 0
-function global:Test-KeplerSignatureGate {
+$originalSignatureGate = ${function:Test-KeplerSignatureGate}
+function Test-KeplerSignatureGate {
     [CmdletBinding()] param([string]$Root)
     $script:sacGateCalls++
 }
@@ -138,7 +139,7 @@ try {
     $sacConditionalBehavior = (-not $offResult) -and $onResult -and ($script:sacGateCalls -eq 1)
 }
 catch { $sacConditionalBehavior = $false }
-finally { Remove-Item function:\Test-KeplerSignatureGate -ErrorAction SilentlyContinue }
+finally { Set-Item function:\Test-KeplerSignatureGate $originalSignatureGate }
 
 $checks = [ordered]@{
     ParserClean = $true
